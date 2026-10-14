@@ -1,0 +1,14 @@
+# scratch space, rebuilt on every run
+work/
+
+# the stub Xcode project: yours to edit, so it stays out of git
+stub/
+
+# anything xcodebuild leaves behind
+build*/
+DerivedData/
+.xloader.lock/
+
+.DS_Store
+*.xcuserdata
+__pycache__/

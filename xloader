@@ -1,0 +1,953 @@
+#!/usr/bin/env bash
+#
+# XLoader — install an .ipa on your own iPhone, signed by your own Apple ID.
+#
+#   ./xloader app.ipa        interactive: pick the phone, the team, the bundle id
+#   ./xloader app.ipa -y     no questions, use whatever it detects
+#   ./xloader --list         what is connected, what is installed
+#
+# Needs macOS with full Xcode and an iPhone. Nothing else.
+
+set -u
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+LIB="$HERE/lib"
+TEMPLATE="$HERE/template"
+
+# Where we keep state. work/ is scratch and rebuilt every run; stub/ is the
+# Xcode project you may edit in the GUI, so it is never rebuilt behind your back.
+WORK="$HERE/work"
+STUB="$HERE/stub"
+STUB_PROJECT="$STUB/XLoaderStub.xcodeproj"
+STUB_PROJECT_FILE="$STUB_PROJECT/project.pbxproj"
+LOCK="$HERE/.xloader.lock"
+
+# Bump when template/ changes, to refresh stub/ once while keeping your settings.
+TEMPLATE_VERSION=2
+
+TEAM_ID_PATTERN='^[A-Z0-9]{10}$'
+
+# --------------------------------------------------------------------------
+# identifiers
+#
+# Apple wants reverse-DNS: at least two dot-separated components of letters,
+# digits and hyphens, each starting and ending with a letter or digit, and 155
+# characters at most. Reject anything else here, because the complaint from
+# Apple's side arrives minutes later and says less.
+# --------------------------------------------------------------------------
+
+valid_bundle_id() {
+  local id="$1"
+  [ -n "$id" ] || return 1
+  [ "${#id}" -le 155 ] || return 1
+  [[ "$id" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
+}
+
+valid_team_id() { printf '%s' "$1" | grep -qE "$TEAM_ID_PATTERN"; }
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+if [ -t 1 ]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'; GREEN=$'\033[32m'; CYAN=$'\033[36m'
+else
+  BOLD=; DIM=; RESET=; GREEN=; CYAN=
+fi
+
+die()  { echo "${BOLD}error:${RESET} $*" >&2; exit "${2:-1}"; }
+step() { echo "${BOLD}==>${RESET} $*"; }
+note() { echo "    ${DIM}$*${RESET}"; }
+
+# --------------------------------------------------------------------------
+# asking the user
+#
+# Prompts collapse to their default whenever stdin is not a terminal, so the same
+# script drives an interactive session and a cron job.
+# --------------------------------------------------------------------------
+
+INTERACTIVE=0
+[ -t 0 ] && INTERACTIVE=1
+
+PICK=""
+TEXT=""
+
+# pick <question> <default number> <"value|description">... -> PICK
+pick() {
+  local question="$1" default_index="$2" option index answer mark
+  shift 2
+  local values=() descriptions=()
+
+  for option in "$@"; do
+    values+=("${option%%|*}")
+    descriptions+=("${option#*|}")
+  done
+  local count="${#values[@]}"
+  [ "$count" -gt 0 ] || { PICK=""; return 1; }
+
+  if [ "$INTERACTIVE" = 1 ]; then
+    printf "\n%s%s%s\n" "$BOLD" "$question" "$RESET"
+    index=0
+    while [ "$index" -lt "$count" ]; do
+      mark=""; [ "$((index + 1))" = "$default_index" ] && mark=" ${DIM}(default)${RESET}"
+      printf "  %2d) %s%s\n" "$((index + 1))" "${descriptions[$index]}" "$mark"
+      index=$((index + 1))
+    done
+    while true; do
+      printf "  %snumber%s [%s]: " "$DIM" "$RESET" "$default_index"
+      IFS= read -r answer || answer=""
+      answer="${answer:-$default_index}"
+      case "$answer" in ''|*[!0-9]*) answer="" ;; esac
+      if [ -n "$answer" ] && [ "$answer" -ge 1 ] && [ "$answer" -le "$count" ]; then break; fi
+      printf "  %stype a number from 1 to %s%s\n" "$DIM" "$count" "$RESET"
+    done
+  else
+    answer="$default_index"
+  fi
+  PICK="${values[$((answer - 1))]}"
+}
+
+# ask <question> <default> -> TEXT   (strips quotes and backslashes from drag & drop)
+ask() {
+  local answer=""
+  if [ "$INTERACTIVE" = 1 ]; then
+    printf "  %s%s%s" "$DIM" "$1" "$RESET"
+    [ -n "$2" ] && printf " [%s]" "$2"
+    IFS= read -r answer || answer=""
+    printf "\n"
+    answer="$(printf '%s' "$answer" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//")"
+  else
+    answer="$2"
+  fi
+  TEXT="${answer:-$2}"
+}
+
+# --------------------------------------------------------------------------
+# arguments
+# --------------------------------------------------------------------------
+
+ipa=""
+keep_watch=0
+assume_yes=0
+list_only=0
+forced_device=""
+forced_team=""
+forced_bundle_id=""
+push_files=()
+export_to=""
+export_password=""
+
+usage() {
+  cat <<'USAGE'
+XLoader <app.ipa> [options]
+
+  -y, --yes           never ask anything, use whatever it detects
+  -l, --list          list connected devices and installed apps, then exit
+      --device UDID   use this device instead of asking
+      --team TEAM     sign with this Team ID instead of asking
+      --bundle-id ID  install as this exact bundle identifier
+      --push FILE     copy FILE into the app's Documents folder after install
+                      (repeatable) — for apps that sign things themselves
+      --export-cert FILE
+                      write the signing identity for this team to FILE as a
+                      .p12, straight out of the keychain, then exit
+      --export-password PW
+                      password for --export-cert (asked for if you leave it out)
+      --keep-watch    keep the Apple Watch app in the IPA (removed by default)
+  -h, --help          this text
+
+With no arguments it asks for an .ipa path — drag and drop works.
+USAGE
+}
+
+positional=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -y|--yes)        assume_yes=1 ;;
+    -l|--list)       list_only=1 ;;
+    --keep-watch)    keep_watch=1 ;;
+    --device)        shift; [ $# -gt 0 ] || die "--device needs a value"; forced_device="$1" ;;
+    --team)          shift; [ $# -gt 0 ] || die "--team needs a value"; forced_team="$1" ;;
+    --bundle-id)     shift; [ $# -gt 0 ] || die "--bundle-id needs a value"; forced_bundle_id="$1" ;;
+    --push)          shift; [ $# -gt 0 ] || die "--push needs a file"; push_files+=("$1") ;;
+    --export-cert)    shift; [ $# -gt 0 ] || die "--export-cert needs a file"; export_to="$1" ;;
+    --export-password) shift; [ $# -gt 0 ] || die "--export-password needs a value"; export_password="$1" ;;
+    -h|--help)       usage; exit 0 ;;
+    -*)              die "unknown option: $1 (try --help)" ;;
+    *)               positional+=("$1") ;;
+  esac
+  shift
+done
+ipa="${positional[*]:-}"
+
+[ "$assume_yes" = 1 ] && INTERACTIVE=0
+
+if [ -z "$ipa" ] && [ "$list_only" = 0 ] && [ -z "$export_to" ]; then
+  if [ "$INTERACTIVE" = 1 ]; then
+    echo "Drag the .ipa into this window and press Enter (Ctrl+C to quit)."
+    IFS= read -r ipa || exit 2
+    ipa="$(printf '%s' "$ipa" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//")"
+    ipa="${ipa//\\ / }"
+  fi
+  [ -n "$ipa" ] || die "no .ipa given. try: ./xloader --help"
+fi
+
+command -v xcodebuild >/dev/null 2>&1 || die "Xcode not found (the full app is required, Command Line Tools are not enough)"
+xcode_version="$(xcodebuild -version 2>/dev/null | head -1 | sed -n 's/^Xcode \([0-9][0-9]*\).*/\1/p')"
+[ "${xcode_version:-0}" -ge 15 ] 2>/dev/null ||
+  die "Xcode 15 or newer is required. found: $(xcodebuild -version 2>/dev/null | head -1)"
+command -v python3 >/dev/null 2>&1 || die "python3 not found"
+[ -z "$ipa" ] || [ -f "$ipa" ] || die "no such file: $ipa"
+
+# --------------------------------------------------------------------------
+# the stub project
+#
+# XLoader never gets certificates or profiles on its own — only Xcode can mint
+# them, and only from a real project. So it ships a throwaway one, copies it to
+# stub/ on first run, and from then on leaves it alone: whatever team you pick in
+# Xcode's Signing & Capabilities is the team it signs with, forever.
+# --------------------------------------------------------------------------
+
+pbx() { python3 "$LIB/xcodeproj.py" "$@"; }
+
+stub_installed_version() {
+  [ -f "$STUB/.template-version" ] && cat "$STUB/.template-version" || echo 0
+}
+
+setup_stub() {
+  local keep_team keep_bundle
+  keep_team="$(pbx get "$STUB_PROJECT_FILE" DEVELOPMENT_TEAM)"
+  keep_bundle="$(pbx get "$STUB_PROJECT_FILE" PRODUCT_BUNDLE_IDENTIFIER)"
+
+  if [ -f "$STUB_PROJECT_FILE" ] && [ "$(stub_installed_version)" = "$TEMPLATE_VERSION" ]; then
+    return 0
+  fi
+
+  rm -rf "$STUB"
+  mkdir -p "$STUB"
+  cp -R "$TEMPLATE/XLoaderStub.xcodeproj" "$STUB_PROJECT"
+  cp -R "$TEMPLATE/src" "$STUB/XLoaderStub"
+  [ -f "$STUB_PROJECT_FILE" ] || die "could not create $STUB_PROJECT_FILE"
+  echo "$TEMPLATE_VERSION" > "$STUB/.template-version"
+
+  # A template upgrade must not cost you the settings you chose in Xcode.
+  [ -n "$keep_team" ] && pbx set "$STUB_PROJECT_FILE" DEVELOPMENT_TEAM "$keep_team"
+  [ -n "$keep_bundle" ] && pbx set "$STUB_PROJECT_FILE" PRODUCT_BUNDLE_IDENTIFIER "$keep_bundle"
+  return 0
+}
+
+# --------------------------------------------------------------------------
+# the phone
+# --------------------------------------------------------------------------
+
+apps_tsv=""   # cached: the phone takes ~15s to answer, so ask once per device
+
+load_apps() { # $1 = team to mark as ours, defaults to the one being used to sign
+  [ -n "$apps_tsv" ] || apps_tsv="$(python3 "$LIB/devicedb.py" apps "$device" "${1:-${team:-}}")"
+}
+
+list_devices() { python3 "$LIB/devicedb.py" devices; }
+
+choose_device() {
+  local rows row connected udid name os state transport
+  while true; do
+    rows="$(list_devices)"
+    if [ -z "$rows" ]; then
+      step "no devices yet"
+      note "connect by USB or Wi-Fi, tap Trust, keep the phone unlocked"
+      [ "$INTERACTIVE" = 1 ] || die "no iPhone found"
+      ask "press Enter to scan again (q quits): " ""
+      [ "$(printf '%s' "$TEXT" | tr '[:upper:]' '[:lower:]')" = q ] && exit 0
+      continue
+    fi
+
+    local options=() connected=0
+    while IFS=$'\t' read -r row; do
+      IFS=$'\t' read -r udid name os state transport <<< "$row"
+      [ "$state" = connected ] && connected=$((connected + 1))
+      if [ "$state" = connected ]; then
+        options+=("$udid|$name  ${DIM}iOS $os · $transport · $udid${RESET}")
+      else
+        options+=("$udid|$name  ${DIM}iOS $os · $transport · not connected · $udid${RESET}")
+      fi
+    done <<< "$rows"
+    options+=("@rescan|${DIM}scan again${RESET}")
+
+    local default_index=1
+    [ "$connected" = 0 ] && default_index="$(( ${#options[@]} - 1 ))"
+
+    pick "which iPhone?" "$default_index" "${options[@]}"
+    [ "$PICK" = "@rescan" ] && continue
+    device="$PICK"
+    return 0
+  done
+}
+
+print_list() {
+  local rows row known_team
+  rows="$(list_devices)"
+  [ -n "$rows" ] || die "Xcode does not know about any device. plug one in and open Xcode once."
+
+  known_team=""
+  [ -f "$STUB_PROJECT_FILE" ] && known_team="$(pbx get "$STUB_PROJECT_FILE" DEVELOPMENT_TEAM)"
+
+  printf "%sdevices%s\n" "$BOLD" "$RESET"
+  while IFS=$'\t' read -r row; do
+    IFS=$'\t' read -r udid name os state transport <<< "$row"
+    if [ "$state" = connected ]; then
+      printf "  %s+%s %-26s iOS %-7s %-9s %s%s%s\n" "$GREEN" "$RESET" "$name" "$os" "$transport" "$DIM" "$udid" "$RESET"
+    else
+      printf "  %s-%s %-26s iOS %-7s %-9s %s%s  %s%s\n" "$DIM" "$RESET" "$name" "$os" "$transport" "$DIM" "$udid" "$state" "$RESET"
+    fi
+  done <<< "$rows"
+
+  while IFS=$'\t' read -r row; do
+    IFS=$'\t' read -r udid name os state transport <<< "$row"
+    [ "$state" = connected ] || continue
+    printf "\n%sinstalled on %s%s\n" "$BOLD" "$name" "$RESET"
+    device="$udid"; apps_tsv=""
+    load_apps "$known_team"
+    [ -n "$apps_tsv" ] || { note "nothing reported — unlock the phone if that looks wrong"; continue; }
+    while IFS=$'\t' read -r bundle_id app_name version mine kind; do
+      [ -n "$bundle_id" ] || continue
+      if [ "$kind" = dev ]; then
+        printf "  %s%-52s%s %-26s %s%s%s" "$CYAN" "$bundle_id" "$RESET" "$app_name" "$DIM" "$version" "$RESET"
+        [ "$mine" = yes ] && printf " %s(yours)%s" "$GREEN" "$RESET"
+        printf "\n"
+      else
+        printf "  %-52s %-26s %s%s%s\n" "$bundle_id" "$app_name" "$DIM" "$version" "$RESET"
+      fi
+    done <<< "$apps_tsv"
+  done <<< "$rows"
+
+  printf "\n%scyan%s = installed by a developer and safe to re-sign. %sgreen (yours)%s = signed by the team on file.\n" \
+    "$DIM" "$RESET" "$GREEN" "$RESET"
+}
+
+# --------------------------------------------------------------------------
+# the signing team
+# --------------------------------------------------------------------------
+
+# Teams Xcode knows about: "Team ID \t name \t free|paid". Empty means no Apple
+# ID has ever been added to Xcode.
+xcode_teams() { python3 "$LIB/accounts.py" teams; }
+
+print_xcode_setup() {
+  cat <<'SETUP'
+
+Xcode has no Apple ID signed in, so it cannot issue signing assets.
+Set Xcode up once, then run this again.
+
+  1. Install Xcode from the App Store. The Command Line Tools are not enough;
+     XLoader drives the full application.
+
+  2. Open Xcode once and let it finish its own setup before going any further.
+
+  3. Xcode -> Settings -> Accounts -> the "+" button -> Apple ID.
+     Sign in with every Apple ID you might want to sign with. Xcode keeps them
+     side by side, each with its own team, and XLoader will offer you a choice
+     between them on the next run.
+
+  4. On the iPhone: Settings -> Privacy & Security -> Developer Mode -> on.
+     The phone restarts afterwards.
+
+  5. Connect the iPhone over USB and tap Trust when it asks. Leave the phone
+     unlocked while XLoader is running.
+
+GUIDE.md has the full walkthrough, including what to do when a particular device
+has not been registered yet.
+SETUP
+}
+
+# One "<team id>\t<certificate name>" line per Apple Development identity.
+dev_certs() {
+  security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | while IFS= read -r line; do
+    name="$(printf '%s\n' "$line" | sed -n 's/.*"\(Apple Development[^"]*\)".*/\1/p')"
+    [ -n "$name" ] || continue
+    owner="$(security find-certificate -c "$name" -p 2>/dev/null |
+      openssl x509 -noout -subject 2>/dev/null |
+      sed -n 's/.*OU=\([A-Z0-9]\{10\}\).*/\1/p')"
+    [ -n "$owner" ] && printf '%s\t%s\n' "$owner" "$name"
+  done
+}
+
+cert_for() { dev_certs | awk -F'\t' -v want="$1" '$1==want{print $2; exit}'; }
+
+has_cert() { printf '%s\n' "$cert_teams" | grep -qxF "$1"; }
+
+candidates=()
+reasons=()
+names=()
+add_candidate() {
+  local id="$1" reason="$2" name="${3:-}" index=0
+  valid_team_id "$id" || return 0
+  while [ "$index" -lt "${#candidates[@]}" ]; do
+    [ "${candidates[$index]}" = "$id" ] && return 0
+    index=$((index + 1))
+  done
+  candidates[${#candidates[@]}]="$id"
+  reasons[${#reasons[@]}]="$reason"
+  names[${#names[@]}]="$name"
+}
+
+# Teams we could plausibly use, best first, each with a reason we can show.
+discover_teams() {
+  local file candidate account_id team_name
+  cert_teams="$(dev_certs | cut -f1)"
+  candidates=(); reasons=(); names=()
+
+  # Every Apple ID signed in to Xcode, by team name. This is the authoritative
+  # list, and it is the only source that knows what the teams are called, so an
+  # account that has never signed anything still shows up here.
+  while IFS=$'\t' read -r account_id team_name _; do
+    [ -n "$account_id" ] || continue
+    if has_cert "$account_id"; then
+      add_candidate "$account_id" "has a certificate" "$team_name"
+    else
+      add_candidate "$account_id" "signed in to Xcode" "$team_name"
+    fi
+  done <<EOF
+$(xcode_teams)
+EOF
+
+  # Xcode keeps one Capabilities bundle per account, and the newest one is the
+  # account you used last. Sorted by name this is just alphabetical, which is how
+  # you end up signing with the wrong account when you have several.
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    candidate="$(printf '%s' "$file" | sed -n 's/.*-\([A-Z0-9]\{10\}\)-bundle\.json/\1/p')"
+    if has_cert "$candidate"; then
+      add_candidate "$candidate" "recent Xcode login, has a certificate"
+    else
+      add_candidate "$candidate" "recent Xcode login"
+    fi
+  done <<EOF2
+$(ls -t ~/Library/Developer/Xcode/UserData/Capabilities/ 2>/dev/null)
+EOF2
+
+  while IFS= read -r candidate; do
+    add_candidate "$candidate" "has a signing certificate"
+  done <<< "$cert_teams"
+
+  candidate="$(python3 "$LIB/devicedb.py" teams <<< "$apps_tsv" | head -1)"
+  [ -n "$candidate" ] && add_candidate "$candidate" "used by an app on this iPhone"
+
+  # A team with no certificate in the keychain cannot sign anything, so only
+  # fall back to one when nothing better turned up.
+  team=""
+  if [ "${#candidates[@]}" -gt 0 ]; then
+    for candidate in "${candidates[@]}"; do
+      if has_cert "$candidate"; then team="$candidate"; break; fi
+    done
+  fi
+  [ -n "$team" ] || team="${candidates[0]:-}"
+}
+
+choose_team() {
+  team="$forced_team"
+  from_xcode=0
+  [ -n "$team" ] || team="$(pbx get "$STUB_PROJECT_FILE" DEVELOPMENT_TEAM)"
+  [ -n "$team" ] && [ -z "$forced_team" ] && from_xcode=1
+
+  if [ -z "$team" ]; then
+    discover_teams
+
+    if [ "$INTERACTIVE" = 1 ] && [ "${#candidates[@]}" -gt 0 ]; then
+      local options=() default_index=1 index=0 id label detail
+      while [ "$index" -lt "${#candidates[@]}" ]; do
+        id="${candidates[$index]}"
+        detail="${names[$index]} · ${reasons[$index]}"
+        label="$id  ${DIM}$detail${RESET}"
+        [ "$id" = "$team" ] && default_index="$((index + 1))"
+        options+=("$id|$label")
+        index=$((index + 1))
+      done
+      options+=("@manual|type another Team ID")
+      options+=("@xcode|${DIM}open the stub project in Xcode and pick it there${RESET}")
+
+      while true; do
+        pick "which team signs this?" "$default_index" "${options[@]}"
+        case "$PICK" in
+          @manual)
+            ask "Team ID (10 characters): " ""
+            if valid_team_id "$TEXT"; then team="$TEXT"; break; fi
+            note "that is not a Team ID" ;;
+          @xcode)
+            open "$STUB_PROJECT" 2>/dev/null || note "could not open Xcode for you"
+            note "set Team under Signing & Capabilities, save, then press Enter"
+            ask "press Enter when done: " ""
+            team="$(pbx get "$STUB_PROJECT_FILE" DEVELOPMENT_TEAM)"
+            [ -n "$team" ] && { from_xcode=1; break; }
+            note "no team in the project yet" ;;
+          *) team="$PICK"; from_xcode=1; break ;;
+        esac
+      done
+    fi
+  fi
+
+  if [ -z "$team" ]; then
+    echo "Could not work out your Team ID."
+    echo "  easiest: open $STUB_PROJECT in Xcode and pick a Team under Signing & Capabilities."
+    echo "  XLoader reads it from there and keeps it."
+    echo "  or paste it (developer.apple.com/account -> Membership):"
+    printf "Team ID: "
+    IFS= read -r team || die "no Team ID given"
+  fi
+
+  valid_team_id "$team" || die "that does not look like a Team ID: $team"
+
+  # Write it back so the project opens with a valid team instead of a red one.
+  if [ "$team" != "$(pbx get "$STUB_PROJECT_FILE" DEVELOPMENT_TEAM)" ]; then
+    pbx set "$STUB_PROJECT_FILE" DEVELOPMENT_TEAM "$team"
+    [ "$INTERACTIVE" = 1 ] && note "saved to the stub project; change it any time in Xcode"
+  fi
+  valid_bundle_id "$(pbx get "$STUB_PROJECT_FILE" PRODUCT_BUNDLE_IDENTIFIER)" ||
+    pbx set "$STUB_PROJECT_FILE" PRODUCT_BUNDLE_IDENTIFIER com.example.xloaderstub
+
+  if [ "$from_xcode" = 1 ]; then
+    step "team: ${BOLD}$team${RESET} ${DIM}(from your Xcode setting)${RESET}"
+  else
+    step "team: ${BOLD}$team${RESET}"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# the ipa
+# --------------------------------------------------------------------------
+
+extract_ipa() {
+  # Stale files here would be signed and shipped, so start from nothing rather
+  # than unzip on top of whatever the last run left behind.
+  local attempt=0
+  while [ "$attempt" -lt 5 ]; do
+    rm -rf "$WORK" 2>/dev/null
+    [ -d "$WORK" ] || break
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  [ -d "$WORK" ] && die "could not clear $WORK — quit Xcode, delete it by hand, and try again"
+
+  mkdir -p "$WORK"
+  unzip -q "$ipa" -d "$WORK" || die "could not unzip $ipa"
+  local app_candidate
+  for app_candidate in "$WORK"/Payload/*.app; do
+    [ -d "$app_candidate" ] && { app_dir="$app_candidate"; break; }
+  done
+  [ -n "$app_dir" ] || die "no .app inside Payload"
+
+  if [ "$keep_watch" = 0 ]; then
+    local watch
+    for watch in "$app_dir/Watch" "$app_dir/com.apple.WatchPlaceholder"; do
+      if [ -e "$watch" ]; then
+        rm -rf "$watch"
+        note "removed the Watch app, free accounts cannot sign it"
+      fi
+    done
+  fi
+
+  app_bundle_id="$(plist_get "$app_dir/Info.plist" CFBundleIdentifier)"
+  app_name="$(plist_get "$app_dir/Info.plist" CFBundleName)"
+  [ -n "$app_name" ] || app_name="$(basename "$app_dir" .app)"
+  valid_bundle_id "$app_bundle_id" ||
+    die "this IPA declares an identifier Apple would not accept: '$app_bundle_id'"
+  step "app: ${BOLD}$app_name${RESET} ${DIM}($app_bundle_id)${RESET}"
+}
+
+plist_get() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null; }
+plist_set() { /usr/libexec/PlistBuddy -c "Set :$2 $3" "$1"; }
+
+# --------------------------------------------------------------------------
+# bundle identifiers
+#
+# Apps are installed as TEAM.<original bundle id>. Every account owns the wildcard
+# TEAM.* App ID, so that namespace always registers. The older <original>.TEAM
+# shape nested inside the developer's namespace instead, and died the moment they
+# registered a wildcard of their own — Apple answers "cannot be registered ...
+# not available". It is still a pure function of app + team, so re-runs keep
+# updating the same install rather than spending a new App ID every week.
+# --------------------------------------------------------------------------
+
+proposed_bundle_id() {
+  local candidate="$team.$app_bundle_id"
+  if [ "${#candidate}" -gt 120 ]; then
+    candidate="$team.$(printf '%s' "$app_bundle_id" |
+      python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.read().encode()).hexdigest()[:10])')"
+  fi
+  printf '%s' "$candidate"
+}
+
+choose_bundle_id() {
+  local fresh installed=""
+  fresh="$(proposed_bundle_id)"
+  [ -n "$forced_bundle_id" ] || installed="$(python3 "$LIB/devicedb.py" find "$app_bundle_id" <<< "$apps_tsv")"
+
+  bundle_candidates=()
+  if [ -n "$forced_bundle_id" ]; then
+    bundle_candidates+=("$forced_bundle_id")
+  elif [ -n "$installed" ]; then
+    bundle_candidates+=("$installed")
+    [ "$installed" = "$fresh" ] || bundle_candidates+=("$fresh")
+  else
+    bundle_candidates+=("$fresh")
+  fi
+
+  if [ "$INTERACTIVE" = 1 ] && [ -z "$forced_bundle_id" ]; then
+    local options=() default_index=1 row
+    if [ -n "$installed" ]; then
+      options+=("$installed|$installed  ${DIM}already on this iPhone, updates in place and keeps your data${RESET}")
+      [ "$installed" = "$fresh" ] || default_index=2
+    else
+      options+=("$fresh|$fresh  ${DIM}yours, always available, fresh install${RESET}")
+    fi
+
+    # Reuse ids we signed before: they are already registered, and reusing one
+    # replaces that app in place instead of installing a second copy.
+    while IFS=$'\t' read -r row; do
+      IFS=$'\t' read -r other_id other_name _ mine _ <<< "$row"
+      [ -n "$other_id" ] || continue
+      [ "$mine" = yes ] || continue
+      [ "$other_id" = "$installed" ] && continue
+      [ "$other_id" = "$app_bundle_id" ] && continue
+      options+=("@reuse|$other_id  ${DIM}replace \"$other_name\"${RESET}")
+    done <<< "$apps_tsv"
+
+    options+=("@custom|type a bundle identifier")
+    pick "install $app_name as which bundle identifier?" "$default_index" "${options[@]}"
+    case "$PICK" in
+      @custom)
+        ask "bundle identifier: " "$fresh"
+        bundle_candidates=("$(printf '%s' "$TEXT" | tr -d '[:space:]')") ;;
+      @reuse) bundle_candidates=("${PICK#@reuse|}") ;;
+      *)       bundle_candidates=("$PICK") ;;
+    esac
+  fi
+
+  local chosen="${bundle_candidates[0]}"
+  valid_bundle_id "$chosen" || die "not a valid bundle identifier: '$chosen'"
+  bundle_candidates=("$chosen")
+
+  # Signing under an identifier that belongs to somebody else's app — anything
+  # that is not namespaced to your own team — is what gets accounts reviewed or
+  # banned, because from Apple's side it looks like you shipped that app.
+  case "$chosen" in
+    "$team".*|"$team") ;;
+    *) note "'$chosen' is not namespaced to your team"
+       note "an identifier you do not own can get the account suspended. $team.$app_bundle_id is the safe form." ;;
+  esac
+}
+
+# --------------------------------------------------------------------------
+# profiles
+#
+# Apple only issues profiles through Xcode, so XLoader builds the stub project
+# once per bundle id it needs. That is also what creates the signing certificate.
+# --------------------------------------------------------------------------
+
+mint_bundle() { # <bundle id> <profile out> -> 0 minted, 2 id taken, 3 unknown device, 1 failed
+  local bundle="$1" out="$2" built produced granted
+  local build_dir="$WORK/build-tmp"
+
+  # A profile left over from the previous bundle id would be silently reused, and
+  # the app would ship with a signature for the wrong bundle.
+  rm -f "$build_dir/XLoaderStub.app/embedded.mobileprovision" 2>/dev/null
+
+  built="$(xcodebuild -project "$STUB_PROJECT" -target XLoaderStub -configuration Debug \
+    -destination "id=$device" -allowProvisioningUpdates \
+    "DEVELOPMENT_TEAM=$team" "PRODUCT_BUNDLE_IDENTIFIER=$bundle" \
+    "CONFIGURATION_BUILD_DIR=$build_dir" build 2>&1)"
+
+  if printf '%s' "$built" | grep -q "BUILD SUCCEEDED"; then
+    produced="$build_dir/XLoaderStub.app/embedded.mobileprovision"
+    [ -f "$produced" ] || { note "xcodebuild succeeded but produced no profile for $bundle"; return 1; }
+    cp "$produced" "$out" || return 1
+    granted="$(python3 "$LIB/sign.py" app-id "$out")"
+    if [ "$granted" != "$team.$bundle" ]; then
+      note "profile is for ${granted:-<unreadable>}, not $team.$bundle — refusing to use it"
+      rm -f "$out"
+      return 1
+    fi
+    return 0
+  fi
+
+  printf '%s' "$built" | grep -qiE "cannot be registered|is not available|already (been|being) used" && return 2
+  printf '%s' "$built" | grep -q "no devices" && return 3
+  printf '%s' "$built" | grep -E "error:" | head -5 >&2
+  return 1
+}
+
+die_unknown_device() {
+  die "Apple does not know $device_name for your team yet.
+
+  Open $STUB_PROJECT in Xcode, set your Team under Signing & Capabilities,
+  choose $device_name as the destination, press Run once, then try again." 3
+}
+
+mint_any() { # <base bundle id> <profile out> <label> -> mint_chosen
+  local candidate status
+  for candidate in "$1" "$1.2" "$1.3" "$1.4"; do
+    mint_bundle "$candidate" "$2"; status=$?
+    case $status in
+      0) mint_chosen="$candidate"; return 0 ;;
+      2) note "$3: $candidate belongs to another team, using a different id" ;;
+      3) die_unknown_device ;;
+      *) return 1 ;;
+    esac
+  done
+  return 1
+}
+
+mint_profiles() {
+  profile_dir="$WORK/profiles"
+  mkdir -p "$profile_dir"
+
+  # Two runs at once would delete each other's scratch directory mid-flight.
+  mkdir "$LOCK" 2>/dev/null ||
+    die "another XLoader run is in progress (lock: $LOCK). wait for it, or delete that folder if it is stale."
+  trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+  step "minting profiles"
+  local index=0 chosen status
+  while [ "$index" -lt 8 ]; do
+    chosen="${bundle_candidates[$index]}"
+    index=$((index + 1))
+    mint_bundle "$chosen" "$profile_dir/app.mobileprovision"; status=$?
+    case $status in
+      0) app_bundle_new="$chosen"; break ;;
+      2) note "$chosen belongs to another team already, trying another id"
+         bundle_candidates+=("$(proposed_bundle_id).$index") ;;
+      3) die_unknown_device ;;
+      *) die "could not mint a profile for $chosen" ;;
+    esac
+  done
+  [ -n "$app_bundle_new" ] || die "could not register a bundle identifier with this team"
+  [ "$app_bundle_new" = "${bundle_candidates[0]}" ] || step "bundle id: ${BOLD}$app_bundle_new${RESET} ${DIM}(changed after a collision)${RESET}"
+  plist_set "$app_dir/Info.plist" CFBundleIdentifier "$app_bundle_new"
+  note "app -> $app_bundle_new"
+
+  # Extensions live under the app's id so iOS can find them.
+  extension_names=()
+  extension_ids=()
+  local appex original short
+  for appex in "$app_dir"/PlugIns/*.appex; do
+    [ -d "$appex" ] || continue
+    original="$(plist_get "$appex/Info.plist" CFBundleIdentifier)"
+    [ -n "$original" ] || continue
+    if ! valid_bundle_id "$original"; then
+      note "skipping ${appex##*/}: unusable identifier '$original'"
+      continue
+    fi
+    short="${original##*.}"
+    extension_names+=("$(basename "$appex" .appex)")
+    extension_ids+=("$app_bundle_new.$short")
+  done
+
+  index=0
+  while [ "$index" -lt "${#extension_names[@]}" ]; do
+    mint_any "${extension_ids[$index]}" \
+      "$profile_dir/${extension_names[$index]}.mobileprovision" \
+      "${extension_names[$index]}" ||
+      die "could not mint a profile for ${extension_names[$index]}"
+    extension_ids[index]="$mint_chosen"
+    plist_set "$app_dir/PlugIns/${extension_names[$index]}.appex/Info.plist" \
+      CFBundleIdentifier "$mint_chosen"
+    note "${extension_names[$index]} -> $mint_chosen"
+    index=$((index + 1))
+  done
+}
+
+# --------------------------------------------------------------------------
+# files the app needs at runtime
+#
+# Some apps sign other things themselves — LiveContainer bundles ZSign, an IPA
+# re-signer — and refuse to do that until it holds a copy of your signing
+# identity. That cannot be baked into the bundle: a private key inside an app is
+# readable by anyone who has the .ipa. It has to be copied into the app's own
+# container, which is what this does.
+# --------------------------------------------------------------------------
+
+push_into_app() { # <file on this Mac>
+  local source="$1" name
+  [ -f "$source" ] || die "no such file to push: $source"
+  name="$(basename "$source")"
+  # The destination must name the file. Left as a bare "Documents", devicectl
+  # creates a *file* called Documents when the app has not made that folder yet.
+  xcrun devicectl device copy to --device "$device" \
+    --domain-type appDataContainer --domain-identifier "$app_bundle_new" \
+    --source "$source" --destination "Documents/$name" >/dev/null 2>&1 ||
+    die "could not copy $name into $app_bundle_new. Open the app once, then re-run." 4
+  note "copied $name into the app's Documents folder"
+}
+
+# Pull the signing identity out of the login keychain and hand it over as a .p12.
+# For a free Apple ID Xcode never writes one to disk — the key exists only in the
+# keychain — so this is the difference between the GUI and a script.
+export_identity() { # <output .p12> <password>
+  local out="$1" password="$2" name
+  name="$(cert_for "$team")"
+  [ -n "$name" ] || die "no signing identity found for team $team"
+  python3 "$LIB/exportcert.py" --identity "$name" --password "$password" --out "$out" >/dev/null ||
+    die "could not export $name from your login keychain"
+}
+
+random_password() { LC_ALL=C tr -dc '[:alnum:]' < /dev/urandom | head -c 16; }
+
+# Apps that re-sign at runtime ask for a certificate; offer before they do.
+offer_certificate() {
+  printf '%s' "$app_bundle_id" | grep -qi "livecontainer" || return 0
+  [ "$INTERACTIVE" = 1 ] || return 0
+
+  echo
+  echo "${BOLD}$app_name signs other apps itself,${RESET} which needs a copy of your Apple"
+  echo "Development certificate — the .p12 Xcode created for your account."
+  note "it is copied into the app's Documents folder, not into the .ipa"
+  ask "copy one in now?" "no"
+  case "$(printf '%s' "$TEXT" | tr '[:upper:]' '[:lower:]')" in
+    y|yes) ;;
+    *) return 0 ;;
+  esac
+
+  pick "where from?" 1 \
+    "export|export it from your login keychain now" \
+    "file|I already have the file" || return 0
+
+  if [ "$PICK" = "export" ]; then
+    local password generated
+    generated="$(random_password)"
+    ask "password for the .p12" "$generated"
+    password="$TEXT"
+    note "you will need this password in the app: $password"
+    export_identity "$WORK/signing-identity.p12" "$password"
+    note "exported $(cert_for "$team")"
+    push_into_app "$WORK/signing-identity.p12"
+    note "enter the password in the app's settings when it asks"
+  else
+    ask "path to the certificate (.p12, .cer, .mobileprovision): " ""
+    [ -n "$TEXT" ] || { note "nothing to copy"; return 0; }
+    push_into_app "$TEXT"
+    note "enter the certificate password in the app's settings when it asks"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# signing and installing
+# --------------------------------------------------------------------------
+
+sign_and_install() {
+  certificate="$(cert_for "$team")"
+  [ -n "$certificate" ] || die "no Apple Development certificate for $team yet.
+
+  Open $STUB_PROJECT in Xcode, set your Team under Signing & Capabilities,
+  choose $device_name as the destination, press Run once, then try again."
+  step "certificate: $certificate"
+
+  step "signing"
+  while IFS=$'\t' read -r name bundle_id dropped; do
+    [ -n "$name" ] || continue
+    note "$name -> $bundle_id"
+    [ "$dropped" != "-" ] && note "$name cannot use: $dropped"
+  done <<< "$(python3 "$LIB/sign.py" entitlements "$team" "$profile_dir" "$app_dir")"
+
+  # Frameworks and libraries have to be signed before whatever contains them.
+  find "$app_dir" \( -name '*.framework' -o -name '*.dylib' \) -print0 |
+    while IFS= read -r -d '' item; do
+      codesign -f -s "$certificate" "$item" >/dev/null 2>&1
+    done
+
+  local index=0 appex complaint
+  while [ "$index" -lt "${#extension_names[@]}" ]; do
+    appex="$app_dir/PlugIns/${extension_names[$index]}.appex"
+    cp "$profile_dir/${extension_names[$index]}.mobileprovision" "$appex/embedded.mobileprovision"
+    complaint="$(codesign -f -s "$certificate" --entitlements "$appex.entitlements.plist" "$appex" 2>&1)" ||
+      { printf '%s\n' "$complaint" >&2; die "could not sign ${extension_names[$index]}"; }
+    index=$((index + 1))
+  done
+
+  cp "$profile_dir/app.mobileprovision" "$app_dir/embedded.mobileprovision"
+  complaint="$(codesign -f -s "$certificate" --entitlements "$app_dir.entitlements.plist" "$app_dir" 2>&1)" ||
+    { printf '%s\n' "$complaint" >&2; die "could not sign the app"; }
+
+  signed_ipa="$WORK/signed.ipa"
+  rm -f "$signed_ipa"
+  ( cd "$WORK" && zip -qry "$signed_ipa" Payload ) || die "could not repack the IPA"
+
+  step "installing"
+  local result
+  result="$(xcrun devicectl device install app --device "$device" "$signed_ipa" 2>&1)"
+  printf '%s' "$result" | grep -q "App installed" || {
+    printf '%s\n' "$result" | tail -15 >&2
+    die "installation failed"
+  }
+  printf '%s' "$result" | grep "bundleID" | sed 's/^/  /'
+
+  local expires
+  expires="$(security cms -D -i "$profile_dir/app.mobileprovision" 2>/dev/null |
+    plutil -extract ExpirationDate raw - 2>/dev/null)"
+  step "profile valid until ${DIM}${expires:-unknown}${RESET} — re-run to refresh"
+
+  # Launched before the push: an app creates its own Documents folder when it
+  # first runs, and devicectl will happily create a plain file called
+  # "Documents" if you push into a container that does not have one yet.
+  step "launching"
+  result="$(xcrun devicectl device process launch --device "$device" "$app_bundle_new" 2>&1)"
+  if printf '%s' "$result" | grep -qiE "^ERROR|failed to launch"; then
+    printf '%s\n' "$result" | grep -iE "reason:|BSErrorCodeDescription" | sed 's/^ */  /' >&2
+    die "installed, but iOS would not launch it. the reason is above (see GUIDE.md)." 4
+  fi
+  printf '%s\n' "$result" | tail -1
+
+  if [ "${#push_files[@]}" -gt 0 ]; then
+    step "copying files into the app"
+    local file
+    for file in "${push_files[@]}"; do push_into_app "$file"; done
+  else
+    offer_certificate
+  fi
+
+  step "done"
+}
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+setup_stub
+[ "$list_only" = 1 ] && { print_list; exit 0; }
+
+# Signing is impossible without an Apple ID in Xcode, and the failure otherwise
+# surfaces several minutes in as an unreadable xcodebuild error.
+if [ -z "$(xcode_teams)" ]; then
+  print_xcode_setup >&2
+  exit 1
+fi
+
+# Just hand over the identity and stop: no iPhone, no IPA needed.
+if [ -n "$export_to" ]; then
+  choose_team
+  if [ -n "$export_password" ]; then
+    export_identity "$export_to" "$export_password"
+  elif [ "$INTERACTIVE" = 1 ]; then
+    ask "password for the .p12" "$(random_password)" || true
+    export_identity "$export_to" "$TEXT"
+  else
+    die "--export-cert needs --export-password when running without a terminal"
+  fi
+  step "wrote $export_to ${DIM}($(cert_for "$team"))${RESET}"
+  note "it holds a private key — delete it once the app has imported it"
+  exit 0
+fi
+
+device="$forced_device"
+[ -n "$device" ] || choose_device
+
+device_row="$(list_devices | awk -F'\t' -v want="$device" '$1==want{print; exit}')"
+[ -n "$device_row" ] || die "Xcode does not know that device: $device"
+IFS=$'\t' read -r _ device_name device_os device_state _ <<< "$device_row"
+[ "$device_state" = connected ] || note "$device_name is not connected right now, it will wake up during install"
+step "device: ${BOLD}$device_name${RESET} ${DIM}iOS $device_os · $device${RESET}"
+
+load_apps
+choose_team
+extract_ipa
+choose_bundle_id
+mint_profiles
+sign_and_install

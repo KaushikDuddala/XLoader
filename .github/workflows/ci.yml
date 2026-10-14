@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: bash -n xloader
+
+      - name: ShellCheck
+        run: brew install shellcheck && shellcheck -s bash xloader
+
+      - name: Python syntax
+        run: python3 -m py_compile lib/*.py
+
+      - name: Stub project parses
+        run: plutil -lint template/XLoaderStub.xcodeproj/project.pbxproj
