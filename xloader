@@ -354,8 +354,8 @@ Set Xcode up once, then run this again.
   5. Connect the iPhone over USB and tap Trust when it asks. Leave the phone
      unlocked while XLoader is running.
 
-GUIDE.md has the full walkthrough, including what to do when a particular device
-has not been registered yet.
+docs/setup.md has the full walkthrough, including what to do when a particular
+device has not been registered yet.
 SETUP
 }
 
@@ -891,7 +891,7 @@ sign_and_install() {
   result="$(xcrun devicectl device process launch --device "$device" "$app_bundle_new" 2>&1)"
   if printf '%s' "$result" | grep -qiE "^ERROR|failed to launch"; then
     printf '%s\n' "$result" | grep -iE "reason:|BSErrorCodeDescription" | sed 's/^ */  /' >&2
-    die "installed, but iOS would not launch it. the reason is above (see GUIDE.md)." 4
+    die "installed, but iOS would not launch it. the reason is above (see docs/troubleshooting.md)." 4
   fi
   printf '%s\n' "$result" | tail -1
 
